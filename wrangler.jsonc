@@ -4,7 +4,7 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-30",
   "vars": {
-    "ALLOWED_FACTION_ID": ""
+    "ALLOWED_FACTION_IDS": ""
   },
   "durable_objects": {
     "bindings": [

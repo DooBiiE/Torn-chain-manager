@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BACKEND_VERSION = "0.3.0";
+const BACKEND_VERSION = "0.4.0";
 const AUTH_TTL_SECONDS = 12 * 60 * 60;
 const ROOM_KEY = "room_state";
 
@@ -50,6 +50,22 @@ function randomToken() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function allowedFactionIds(env) {
+  const raw = String(env.ALLOWED_FACTION_IDS ?? env.ALLOWED_FACTION_ID ?? "").trim();
+  if (!raw) return [];
+  return [...new Set(
+    raw
+      .split(/[\s,;]+/)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+  )];
+}
+
+function isFactionAllowed(env, factionId) {
+  const allowed = allowedFactionIds(env);
+  return allowed.length === 0 || allowed.includes(Number(factionId));
 }
 
 async function tornJson(path, apiKey) {
@@ -504,7 +520,13 @@ export class FactionRoom extends DurableObject {
         const chainMax = clampInt(chain.max, 0, 100000000, 0);
         const chainTimeout = clampInt(chain.timeout, 0, 36000, 0);
         const lastMs = Number(room.session._chain_snapshot_ms || 0);
-        const chainChanged = chainId !== room.session.chain_id || chainCurrent !== Number(room.session.chain_current || 0) || chainMax !== Number(room.session.chain_max || 0);
+        const previousTimeout = Number(room.session.chain_timeout || 0);
+        const elapsedSinceSnapshot = lastMs > 0 ? Math.max(0, Math.floor((now - lastMs) / 1000)) : 0;
+        const expectedRemaining = lastMs > 0 ? Math.max(0, previousTimeout - elapsedSinceSnapshot) : 0;
+        // A successful chain hit resets Torn's timer upward. Detect that jump even
+        // when hit_complete already updated chain_current before this heartbeat.
+        const timerReset = lastMs > 0 && chainTimeout > expectedRemaining + 10;
+        const chainChanged = chainId !== room.session.chain_id || chainCurrent !== Number(room.session.chain_current || 0) || chainMax !== Number(room.session.chain_max || 0) || timerReset;
         const refreshDue = now - lastMs >= 45000;
 
         if (chainChanged || refreshDue) {
@@ -617,6 +639,8 @@ export default {
         service: "DooBiiE's Chain Manager backend",
         version: BACKEND_VERSION,
         transport: "Cloudflare Worker + Durable Objects + WebSocket Hibernation",
+        restricted: allowedFactionIds(env).length > 0,
+        allowed_faction_count: allowedFactionIds(env).length,
       });
     }
 
@@ -627,9 +651,8 @@ export default {
 
       try {
         const auth = await tornIdentity(apiKey);
-        const allowedFactionId = Number(env.ALLOWED_FACTION_ID || 0);
-        if (allowedFactionId > 0 && auth.faction_id !== allowedFactionId) {
-          return json(errorObject("This backend is restricted to another faction", 403), 403);
+        if (!isFactionAllowed(env, auth.faction_id)) {
+          return json(errorObject("Your faction is not authorised to use this Chain Manager", 403), 403);
         }
 
         const token = randomToken();
@@ -659,9 +682,8 @@ export default {
       const auth = await resolveAuth(env, token);
       if (!auth) return json(errorObject("Session expired", 401), 401);
 
-      const allowedFactionId = Number(env.ALLOWED_FACTION_ID || 0);
-      if (allowedFactionId > 0 && Number(auth.faction_id) !== allowedFactionId) {
-        return json(errorObject("Faction not allowed", 403), 403);
+      if (!isFactionAllowed(env, auth.faction_id)) {
+        return json(errorObject("Your faction is not authorised to use this Chain Manager", 403), 403);
       }
 
       const roomId = env.FACTION_ROOMS.idFromName(String(auth.faction_id));
