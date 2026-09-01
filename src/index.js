@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BACKEND_VERSION = "0.4.0";
+const BACKEND_VERSION = "0.4.1";
 const AUTH_TTL_SECONDS = 12 * 60 * 60;
 const ROOM_KEY = "room_state";
 
@@ -297,11 +297,7 @@ export class FactionRoom extends DurableObject {
   }
 
   async fetch(request) {
-    const upgrade = request.headers.get("Upgrade");
-    if (!upgrade || upgrade.toLowerCase() !== "websocket") {
-      return json(errorObject("WebSocket upgrade required", 426), 426);
-    }
-
+    const url = new URL(request.url);
     const encoded = request.headers.get("X-Chain-Auth") || "";
     let auth;
     try {
@@ -310,7 +306,45 @@ export class FactionRoom extends DurableObject {
       return json(errorObject("Invalid session", 401), 401);
     }
 
-    if (!auth?.user_id || !auth?.faction_id) return json(errorObject("Invalid session", 401), 401);
+    if (!auth?.user_id || !auth?.faction_id) {
+      return json(errorObject("Invalid session", 401), 401);
+    }
+
+    // HTTP fallback for Torn PDA.
+    if (request.method === "GET" && url.pathname === "/http-state") {
+      const room = await this.loadRoom();
+      return json({ ok: true, ...payloadFor(room, auth) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/http-action") {
+      const body = await readJson(request);
+      const action = String(body?.action || "state");
+      let room = await this.loadRoom();
+
+      try {
+        const result = this.applyAction(room, auth, action, body);
+        room = result.room;
+        const mutated = result.mutated;
+
+        if (mutated) {
+          this.roomCache = room;
+          const persistNow = action !== "heartbeat" || Date.now() - this.lastPersistAt >= 120000;
+          if (persistNow) await this.saveRoom(room);
+          await this.broadcastState(room);
+        }
+
+        return json({ ok: true, ...payloadFor(room, auth) });
+      } catch (error) {
+        const status = Number(error?.status || 400);
+        return json(errorObject(error?.message || String(error), status), status);
+      }
+    }
+
+    // Realtime WebSocket path for desktop.
+    const upgrade = request.headers.get("Upgrade");
+    if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+      return json(errorObject("WebSocket upgrade required", 426), 426);
+    }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -617,6 +651,19 @@ export class FactionRoom extends DurableObject {
   }
 }
 
+async function routeRoomHttp(env, auth, path, request) {
+  const roomId = env.FACTION_ROOMS.idFromName(String(auth.faction_id));
+  const roomStub = env.FACTION_ROOMS.get(roomId);
+  const headers = new Headers(request.headers);
+  headers.set("X-Chain-Auth", encodeURIComponent(JSON.stringify(auth)));
+
+  return roomStub.fetch(`https://room${path}`, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+  });
+}
+
 async function resolveAuth(env, token) {
   if (!/^[a-f0-9]{64}$/i.test(token || "")) return null;
   const id = env.AUTH_SESSIONS.idFromName(token);
@@ -675,6 +722,26 @@ export default {
       } catch (error) {
         return json(errorObject(error?.message || "Torn authentication failed", 401), 401);
       }
+    }
+
+    if ((request.method === "GET" && url.pathname === "/api/v1/state") ||
+        (request.method === "POST" && url.pathname === "/api/v1/action")) {
+      const authHeader = String(request.headers.get("Authorization") || "");
+      const tokenMatch = authHeader.match(/^Bearer\s+([A-Fa-f0-9]{64})$/);
+      const token = tokenMatch ? tokenMatch[1] : "";
+      const auth = await resolveAuth(env, token);
+      if (!auth) return json(errorObject("Session expired", 401), 401);
+
+      if (!isFactionAllowed(env, auth.faction_id)) {
+        return json(errorObject("Your faction is not authorised to use this Chain Manager", 403), 403);
+      }
+
+      return routeRoomHttp(
+        env,
+        auth,
+        url.pathname.endsWith("/state") ? "/http-state" : "/http-action",
+        request
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/v1/ws") {
