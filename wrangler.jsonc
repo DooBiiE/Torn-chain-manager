@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "torn-chain-manager-doobiie",
-  "main": "src/index.js",
+  "main": "src/index-targets.js",
   "compatibility_date": "2026-08-30",
   "vars": {
     "ALLOWED_FACTION_IDS": "53956"
@@ -15,6 +15,10 @@
       {
         "name": "FACTION_ROOMS",
         "class_name": "FactionRoom"
+      },
+      {
+        "name": "TARGET_CALLS",
+        "class_name": "TargetCalls"
       }
     ]
   },
@@ -24,6 +28,10 @@
       "storage": "sqlite"
     },
     "FactionRoom": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "TargetCalls": {
       "type": "durable-object",
       "storage": "sqlite"
     }
