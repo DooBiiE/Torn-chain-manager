@@ -11,12 +11,6 @@
     "CLOUDFLARE_ACCOUNT_ID": "d55af0adfc7e01b816c8db5780c682ac"
   },
 
-  "secrets": {
-    "required": [
-      "CLOUDFLARE_ANALYTICS_TOKEN"
-    ]
-  },
-
   "durable_objects": {
     "bindings": [
       {
