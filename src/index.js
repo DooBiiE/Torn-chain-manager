@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BACKEND_VERSION = "0.4.5";
+const BACKEND_VERSION = "0.4.6";
 const AUTH_TTL_SECONDS = 12 * 60 * 60;
 const ROOM_KEY = "room_state";
 const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
@@ -108,11 +108,22 @@ function unconfiguredUsage(env, reason = "Cloudflare Analytics credentials are n
     DEFAULT_DO_DAILY_REQUEST_LIMIT
   );
 
+  const accountIdPresent = String(env.CLOUDFLARE_ACCOUNT_ID || "").trim().length > 0;
+  const analyticsTokenPresent = String(env.CLOUDFLARE_ANALYTICS_TOKEN || "").trim().length > 0;
+  const accountIdValid = /^[a-f0-9]{32}$/i.test(String(env.CLOUDFLARE_ACCOUNT_ID || "").trim());
+  const analyticsTokenValidShape = String(env.CLOUDFLARE_ANALYTICS_TOKEN || "").trim().length >= 20;
+
   return {
     available: false,
     configured: false,
     source: "cloudflare-graphql",
     reason,
+    credentials: {
+      account_id_detected: accountIdPresent,
+      account_id_valid_shape: accountIdValid,
+      analytics_token_detected: analyticsTokenPresent,
+      analytics_token_valid_shape: analyticsTokenValidShape,
+    },
     generated_at: new Date().toISOString(),
     reset_at: nextUtcMidnightIso(),
     cache_seconds: Math.round(USAGE_CACHE_MS / 1000),
@@ -217,6 +228,12 @@ async function fetchCloudflareUsage(env) {
     available: true,
     configured: true,
     source: "cloudflare-graphql",
+    credentials: {
+      account_id_detected: true,
+      account_id_valid_shape: true,
+      analytics_token_detected: true,
+      analytics_token_valid_shape: true,
+    },
     scope: "account-wide",
     generated_at: new Date().toISOString(),
     reset_at: nextUtcMidnightIso(),
@@ -261,10 +278,17 @@ async function getCloudflareUsage(env, force = false) {
     } catch (error) {
       // Do not break Chain Manager because Cloudflare Analytics is temporarily
       // unavailable. Keep queue actions live and report the metrics problem.
+      const fallbackBase = unconfiguredUsage(
+        env,
+        error?.message || "Cloudflare Analytics unavailable"
+      );
       const fallback = {
-        ...unconfiguredUsage(env, error?.message || "Cloudflare Analytics unavailable"),
+        ...fallbackBase,
         available: false,
-        configured: true,
+        configured: Boolean(
+          fallbackBase?.credentials?.account_id_detected &&
+          fallbackBase?.credentials?.analytics_token_detected
+        ),
         level: "unknown",
       };
       usageCache.value = fallback;
