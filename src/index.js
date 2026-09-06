@@ -274,6 +274,12 @@ export class AuthSession extends DurableObject {
   }
 }
 
+// Cap on how long a PDA/HTTP long-poll request may be held open before the
+// Durable Object answers anyway. Cloudflare's edge and most HTTP bridges
+// (GM_xmlhttpRequest, PDA_httpGet) are comfortable well past this, but keep
+// it conservative so a client's own request timeout never fires first.
+const HTTP_LONG_POLL_MAX_WAIT_MS = 25_000;
+
 export class FactionRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -281,6 +287,11 @@ export class FactionRoom extends DurableObject {
     this.env = env;
     this.roomCache = null;
     this.lastPersistAt = 0;
+    // In-memory only - reset on eviction/restart. That's fine: worst case a
+    // stale "since" value just gets an immediate reply instead of a held one,
+    // which is harmless and self-corrects on the very next request.
+    this.version = 0;
+    this.waiters = new Set();
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -294,6 +305,20 @@ export class FactionRoom extends DurableObject {
     this.roomCache = room;
     await this.ctx.storage.put(ROOM_KEY, room);
     this.lastPersistAt = Date.now();
+  }
+
+  // Called any time a mutation actually changes room state, from both the
+  // HTTP/PDA action path and the WebSocket path. Wakes every HTTP long-poll
+  // request currently held open on this Durable Object instance immediately,
+  // regardless of which member's device is holding it - a mutation from any
+  // member is relevant to everyone's queue view.
+  bumpVersion() {
+    this.version += 1;
+    const waiters = this.waiters;
+    this.waiters = new Set();
+    for (const wake of waiters) {
+      try { wake(); } catch {}
+    }
   }
 
   async fetch(request) {
@@ -310,10 +335,28 @@ export class FactionRoom extends DurableObject {
       return json(errorObject("Invalid session", 401), 401);
     }
 
-    // HTTP fallback for Torn PDA.
+    // HTTP fallback for Torn PDA. Supports an optional long-poll: pass
+    // ?since=<version>&wait=<ms> and this holds the response open (up to
+    // HTTP_LONG_POLL_MAX_WAIT_MS) until either the room mutates past that
+    // version or the wait elapses, instead of answering immediately every
+    // time. A client that never sends since/wait gets the old immediate
+    // behaviour, unchanged.
     if (request.method === "GET" && url.pathname === "/http-state") {
+      const since = Number(url.searchParams.get("since"));
+      const requestedWait = Number(url.searchParams.get("wait"));
+      const waitMs = Number.isFinite(requestedWait)
+        ? Math.min(HTTP_LONG_POLL_MAX_WAIT_MS, Math.max(0, requestedWait))
+        : 0;
+
+      if (waitMs > 0 && Number.isFinite(since) && since === this.version) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, waitMs);
+          this.waiters.add(() => { clearTimeout(timer); resolve(); });
+        });
+      }
+
       const room = await this.loadRoom();
-      return json({ ok: true, ...payloadFor(room, auth) });
+      return json({ ok: true, version: this.version, ...payloadFor(room, auth) });
     }
 
     if (request.method === "POST" && url.pathname === "/http-action") {
@@ -330,10 +373,11 @@ export class FactionRoom extends DurableObject {
           this.roomCache = room;
           const persistNow = action !== "heartbeat" || Date.now() - this.lastPersistAt >= 120000;
           if (persistNow) await this.saveRoom(room);
+          this.bumpVersion();
           await this.broadcastState(room);
         }
 
-        return json({ ok: true, ...payloadFor(room, auth) });
+        return json({ ok: true, version: this.version, ...payloadFor(room, auth) });
       } catch (error) {
         const status = Number(error?.status || 400);
         return json(errorObject(error?.message || String(error), status), status);
@@ -352,7 +396,7 @@ export class FactionRoom extends DurableObject {
     server.serializeAttachment(auth);
 
     const room = await this.loadRoom();
-    server.send(JSON.stringify({ type: "state", ok: true, ...payloadFor(room, auth) }));
+    server.send(JSON.stringify({ type: "state", ok: true, version: this.version, ...payloadFor(room, auth) }));
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -366,7 +410,7 @@ export class FactionRoom extends DurableObject {
       const key = String(auth.user_id);
       let text = textByUser.get(key);
       if (!text) {
-        text = JSON.stringify({ type: "state", ok: true, ...payloadFor(room, auth) });
+        text = JSON.stringify({ type: "state", ok: true, version: this.version, ...payloadFor(room, auth) });
         textByUser.set(key, text);
       }
       try { ws.send(text); } catch {}
@@ -404,16 +448,20 @@ export class FactionRoom extends DurableObject {
         this.roomCache = room;
         const persistNow = action !== "heartbeat" || Date.now() - this.lastPersistAt >= 120000;
         if (persistNow) await this.saveRoom(room);
+        this.bumpVersion();
       }
 
       const response = {
         type: "response",
         request_id: requestId,
         ok: true,
+        version: this.version,
         ...payloadFor(room, auth),
       };
       try { ws.send(JSON.stringify(response)); } catch {}
 
+      // Also wake any PDA/HTTP long-poll waiters - a WS client's action is
+      // just as relevant to a queue member polling over HTTP.
       if (mutated) await this.broadcastState(room);
     } catch (error) {
       const status = Number(error?.status || 400);
