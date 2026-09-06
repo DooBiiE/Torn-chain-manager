@@ -368,14 +368,22 @@ export class FactionRoom extends DurableObject {
         const result = this.applyAction(room, auth, action, body);
         room = result.room;
         const mutated = result.mutated;
+        // Falls back to mutated for every action that doesn't explicitly say
+        // otherwise (only the heartbeat handler distinguishes telemetry-only
+        // changes as non-urgent) - safe default, nothing else's behavior changes.
+        const urgent = result.urgent ?? mutated;
 
         if (mutated) {
           this.roomCache = room;
           const persistNow = action !== "heartbeat" || Date.now() - this.lastPersistAt >= 120000;
           if (persistNow) await this.saveRoom(room);
-          this.bumpVersion();
+          // WebSocket clients are cheap to push to regardless, so keep them
+          // live on every change, including plain telemetry.
           await this.broadcastState(room);
         }
+        // Only wake OTHER devices' held HTTP long-polls for a queue-relevant
+        // change - not for every heartbeat's routine energy/health/status tick.
+        if (urgent) this.bumpVersion();
 
         return json({ ok: true, version: this.version, ...payloadFor(room, auth) });
       } catch (error) {
@@ -443,13 +451,16 @@ export class FactionRoom extends DurableObject {
       const result = this.applyAction(room, auth, action, body);
       room = result.room;
       mutated = result.mutated;
+      const urgent = result.urgent ?? mutated;
 
       if (mutated) {
         this.roomCache = room;
         const persistNow = action !== "heartbeat" || Date.now() - this.lastPersistAt >= 120000;
         if (persistNow) await this.saveRoom(room);
-        this.bumpVersion();
       }
+      // Only wake PDA/HTTP long-poll waiters for a queue-relevant change, same
+      // rule as the HTTP action path - not for every routine telemetry tick.
+      if (urgent) this.bumpVersion();
 
       const response = {
         type: "response",
@@ -460,8 +471,7 @@ export class FactionRoom extends DurableObject {
       };
       try { ws.send(JSON.stringify(response)); } catch {}
 
-      // Also wake any PDA/HTTP long-poll waiters - a WS client's action is
-      // just as relevant to a queue member polling over HTTP.
+      // WS clients stay live on every change, including plain telemetry.
       if (mutated) await this.broadcastState(room);
     } catch (error) {
       const status = Number(error?.status || 400);
@@ -588,6 +598,12 @@ export class FactionRoom extends DurableObject {
 
       const previousSeenMs = toMs(currentMember.last_seen_at);
       let mutated = applyTelemetry(currentMember, body);
+      // Telemetry (energy/health/status ticking as it naturally does) is worth
+      // saving so the next real poll sees it, but it is NOT worth waking every
+      // other member's held long-poll request for - nobody needs an instant
+      // push because someone's energy regenerated. Only an actual chain
+      // change below is urgent.
+      let urgent = false;
 
       // Persist a freshness heartbeat at most every two minutes even when values stay unchanged.
       if (mutated || now - previousSeenMs >= 120000) {
@@ -619,10 +635,13 @@ export class FactionRoom extends DurableObject {
           room.session.chain_snapshot_at = nowSql;
           room.session._chain_snapshot_ms = now;
           mutated = true;
+          // A routine 45s freshness resync with no real change isn't urgent
+          // either - only an actual chain change (reset, new chain, etc) is.
+          if (chainChanged) urgent = true;
         }
       }
 
-      return { room, mutated };
+      return { room, mutated, urgent };
     }
 
     if (action === "set_threshold") {
