@@ -1,9 +1,308 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BACKEND_VERSION = "0.4.4";
+const BACKEND_VERSION = "0.4.5";
 const AUTH_TTL_SECONDS = 12 * 60 * 60;
 const ROOM_KEY = "room_state";
 const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
+
+// Cloudflare usage reporting. Analytics is cached so normal queue traffic does
+// not create a matching Analytics API request. Defaults match Workers Free as
+// of 2026-09; override with env vars if the account plan/limits change.
+const USAGE_CACHE_MS = 5 * 60 * 1000;
+const DEFAULT_WORKER_DAILY_REQUEST_LIMIT = 100_000;
+const DEFAULT_DO_DAILY_REQUEST_LIMIT = 100_000;
+
+let usageCache = {
+  key: "",
+  expiresAt: 0,
+  value: null,
+  inFlight: null,
+};
+
+function positiveEnvInt(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback;
+}
+
+function utcDateString(ms = Date.now()) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function nextUtcMidnightIso(now = Date.now()) {
+  const d = new Date(now);
+  const next = Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth(),
+    d.getUTCDate() + 1,
+    0, 0, 0, 0
+  );
+  return new Date(next).toISOString();
+}
+
+function usageLevel(maxPercent) {
+  const p = Number(maxPercent || 0);
+  if (p >= 100) return "limit_reached";
+  if (p >= 97) return "critical";
+  if (p >= 90) return "high";
+  if (p >= 75) return "watch";
+  return "normal";
+}
+
+function conservationForLevel(level) {
+  switch (level) {
+    case "limit_reached":
+      return { multiplier: 8, near_role_multiplier: 2.5 };
+    case "critical":
+      return { multiplier: 4, near_role_multiplier: 1.8 };
+    case "high":
+      return { multiplier: 2, near_role_multiplier: 1.35 };
+    case "watch":
+      return { multiplier: 1.35, near_role_multiplier: 1.15 };
+    default:
+      return { multiplier: 1, near_role_multiplier: 1 };
+  }
+}
+
+function usageWarning(level) {
+  switch (level) {
+    case "limit_reached":
+      return "Cloudflare daily usage appears to have reached a configured limit. Requests may be rejected until 00:00 UTC.";
+    case "critical":
+      return "Cloudflare usage is very high. Strong conservation mode is active; the service may stop if the daily limit is reached.";
+    case "high":
+      return "Cloudflare usage is high. Background traffic is being reduced automatically.";
+    case "watch":
+      return "Cloudflare usage is elevated. Light conservation mode is active.";
+    default:
+      return "";
+  }
+}
+
+function metricUsage(requests, limit) {
+  const used = Math.max(0, Math.trunc(Number(requests || 0)));
+  const max = Math.max(1, Math.trunc(Number(limit || 1)));
+  const percent = Math.max(0, (used / max) * 100);
+  return {
+    requests: used,
+    limit: max,
+    remaining: Math.max(0, max - used),
+    percent: Math.round(percent * 10) / 10,
+  };
+}
+
+function sumGraphqlRequests(rows) {
+  if (!Array.isArray(rows)) return 0;
+  return rows.reduce((sum, row) => {
+    const value = Number(row?.sum?.requests || 0);
+    return sum + (Number.isFinite(value) && value > 0 ? value : 0);
+  }, 0);
+}
+
+function unconfiguredUsage(env, reason = "Cloudflare Analytics credentials are not configured") {
+  const workerLimit = positiveEnvInt(
+    env.WORKER_DAILY_REQUEST_LIMIT,
+    DEFAULT_WORKER_DAILY_REQUEST_LIMIT
+  );
+  const doLimit = positiveEnvInt(
+    env.DO_DAILY_REQUEST_LIMIT,
+    DEFAULT_DO_DAILY_REQUEST_LIMIT
+  );
+
+  return {
+    available: false,
+    configured: false,
+    source: "cloudflare-graphql",
+    reason,
+    generated_at: new Date().toISOString(),
+    reset_at: nextUtcMidnightIso(),
+    cache_seconds: Math.round(USAGE_CACHE_MS / 1000),
+    analytics_may_lag: true,
+    hard_stop: false,
+    worker: metricUsage(0, workerLimit),
+    durable_objects: metricUsage(0, doLimit),
+    level: "unknown",
+    conservation_multiplier: 1,
+    near_role_multiplier: 1,
+    warning: "",
+  };
+}
+
+async function fetchCloudflareUsage(env) {
+  const accountId = String(env.CLOUDFLARE_ACCOUNT_ID || "").trim();
+  const token = String(env.CLOUDFLARE_ANALYTICS_TOKEN || "").trim();
+
+  if (!/^[a-f0-9]{32}$/i.test(accountId) || token.length < 20) {
+    return unconfiguredUsage(env);
+  }
+
+  const now = Date.now();
+  const startIso = `${utcDateString(now)}T00:00:00.000Z`;
+  const endIso = new Date(now).toISOString();
+  const yesterday = utcDateString(now - 24 * 60 * 60 * 1000);
+
+  // workersInvocationsAdaptive is the dataset Cloudflare documents for Worker
+  // request totals. durableObjectsInvocationsAdaptiveGroups is the documented
+  // Durable Object requests dataset. We intentionally query ACCOUNT-WIDE totals
+  // because the Free-plan quotas are account-wide, not just this script.
+  const query = `
+    {
+      viewer {
+        accounts(filter: { accountTag: ${JSON.stringify(accountId)} }) {
+          workersInvocationsAdaptive(
+            limit: 10000,
+            filter: {
+              datetime_geq: ${JSON.stringify(startIso)},
+              datetime_leq: ${JSON.stringify(endIso)}
+            }
+          ) {
+            sum { requests }
+          }
+          durableObjectsInvocationsAdaptiveGroups(
+            limit: 10000,
+            filter: { date_gt: ${JSON.stringify(yesterday)} }
+          ) {
+            sum { requests }
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ query }),
+  });
+
+  let result = {};
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error(`Cloudflare Analytics returned HTTP ${response.status}`);
+  }
+
+  if (!response.ok) {
+    const message = result?.errors?.[0]?.message || `Cloudflare Analytics HTTP ${response.status}`;
+    throw new Error(message);
+  }
+
+  if (Array.isArray(result?.errors) && result.errors.length) {
+    throw new Error(String(result.errors[0]?.message || "Cloudflare Analytics query failed"));
+  }
+
+  const account = result?.data?.viewer?.accounts?.[0];
+  if (!account) throw new Error("Cloudflare Analytics account not found");
+
+  const workerRequests = sumGraphqlRequests(account.workersInvocationsAdaptive);
+  const doRequests = sumGraphqlRequests(account.durableObjectsInvocationsAdaptiveGroups);
+
+  const worker = metricUsage(
+    workerRequests,
+    positiveEnvInt(env.WORKER_DAILY_REQUEST_LIMIT, DEFAULT_WORKER_DAILY_REQUEST_LIMIT)
+  );
+  const durableObjects = metricUsage(
+    doRequests,
+    positiveEnvInt(env.DO_DAILY_REQUEST_LIMIT, DEFAULT_DO_DAILY_REQUEST_LIMIT)
+  );
+
+  const maxPercent = Math.max(worker.percent, durableObjects.percent);
+  const level = usageLevel(maxPercent);
+  const conservation = conservationForLevel(level);
+
+  return {
+    available: true,
+    configured: true,
+    source: "cloudflare-graphql",
+    scope: "account-wide",
+    generated_at: new Date().toISOString(),
+    reset_at: nextUtcMidnightIso(),
+    cache_seconds: Math.round(USAGE_CACHE_MS / 1000),
+    analytics_may_lag: true,
+    hard_stop: false,
+    worker,
+    durable_objects: durableObjects,
+    max_percent: Math.round(maxPercent * 10) / 10,
+    level,
+    conservation_multiplier: conservation.multiplier,
+    near_role_multiplier: conservation.near_role_multiplier,
+    warning: usageWarning(level),
+  };
+}
+
+async function getCloudflareUsage(env, force = false) {
+  const key = [
+    String(env.CLOUDFLARE_ACCOUNT_ID || ""),
+    String(env.WORKER_DAILY_REQUEST_LIMIT || DEFAULT_WORKER_DAILY_REQUEST_LIMIT),
+    String(env.DO_DAILY_REQUEST_LIMIT || DEFAULT_DO_DAILY_REQUEST_LIMIT),
+    String(Boolean(env.CLOUDFLARE_ANALYTICS_TOKEN)),
+  ].join("|");
+
+  const now = Date.now();
+
+  if (!force && usageCache.key === key && usageCache.value && now < usageCache.expiresAt) {
+    return usageCache.value;
+  }
+
+  if (!force && usageCache.key === key && usageCache.inFlight) {
+    return usageCache.inFlight;
+  }
+
+  usageCache.key = key;
+  usageCache.inFlight = (async () => {
+    try {
+      const value = await fetchCloudflareUsage(env);
+      usageCache.value = value;
+      usageCache.expiresAt = Date.now() + USAGE_CACHE_MS;
+      return value;
+    } catch (error) {
+      // Do not break Chain Manager because Cloudflare Analytics is temporarily
+      // unavailable. Keep queue actions live and report the metrics problem.
+      const fallback = {
+        ...unconfiguredUsage(env, error?.message || "Cloudflare Analytics unavailable"),
+        available: false,
+        configured: true,
+        level: "unknown",
+      };
+      usageCache.value = fallback;
+      // Retry a failed analytics lookup sooner than a healthy one.
+      usageCache.expiresAt = Date.now() + 60_000;
+      return fallback;
+    } finally {
+      usageCache.inFlight = null;
+    }
+  })();
+
+  return usageCache.inFlight;
+}
+
+async function enrichJsonResponseWithUsage(response, env) {
+  if (!response || response.status === 101) return response;
+
+  const contentType = String(response.headers.get("Content-Type") || "");
+  if (!contentType.includes("application/json")) return response;
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    return response;
+  }
+
+  const cloudflareUsage = await getCloudflareUsage(env);
+
+  return json(
+    {
+      ...data,
+      cloudflare_usage: cloudflareUsage,
+    },
+    response.status,
+    { "Cache-Control": "no-store" }
+  );
+}
 
 function corsHeaders(extra = {}) {
   return {
@@ -884,6 +1183,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health" || url.pathname === "/api/v1/health")) {
+      const cloudflareUsage = await getCloudflareUsage(env);
       return json({
         ok: true,
         service: "DooBiiE's Chain Manager backend",
@@ -891,7 +1191,8 @@ export default {
         transport: "Cloudflare Worker + Durable Objects + WebSocket Hibernation",
         restricted: allowedFactionIds(env).length > 0,
         allowed_faction_count: allowedFactionIds(env).length,
-      });
+        cloudflare_usage: cloudflareUsage,
+      }, 200, { "Cache-Control": "no-store" });
     }
 
     if (request.method === "POST" && url.pathname === "/api/v1/auth") {
@@ -939,12 +1240,16 @@ export default {
         return json(errorObject("Your faction is not authorised to use this Chain Manager", 403), 403);
       }
 
-      return routeRoomHttp(
+      const roomResponse = await routeRoomHttp(
         env,
         auth,
         url.pathname.endsWith("/state") ? "/http-state" : "/http-action",
         request
       );
+
+      // Piggyback the cached account-wide Cloudflare usage onto the normal
+      // state/action response so clients do not need a second polling endpoint.
+      return enrichJsonResponseWithUsage(roomResponse, env);
     }
 
     if (request.method === "GET" && url.pathname === "/api/v1/ws") {

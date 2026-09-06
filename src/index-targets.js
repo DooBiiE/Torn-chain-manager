@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 
 export { AuthSession, FactionRoom };
 
-const TARGET_TRIAL_VERSION = "0.5.2";
+const TARGET_TRIAL_VERSION = "0.5.3";
 const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 const TARGET_STATE_KEY = "target_calls_v1";
 
@@ -329,6 +329,7 @@ export default {
           queue_backend_version: data?.version || null,
           target_calls: true,
           target_calls_shared_state: true,
+          cloudflare_usage_reporting: true,
           target_call_ttl_hours: TARGET_CALL_TTL_MS / 3600000,
         }, response.status);
       } catch {
