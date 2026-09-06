@@ -1,8 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BACKEND_VERSION = "0.4.1";
+const BACKEND_VERSION = "0.4.3";
 const AUTH_TTL_SECONDS = 12 * 60 * 60;
 const ROOM_KEY = "room_state";
+const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 
 function corsHeaders(extra = {}) {
   return {
@@ -124,11 +125,48 @@ async function tornIdentity(apiKey) {
   };
 }
 
+function normalizeTargetCalls(raw, now = Date.now()) {
+  const source = Array.isArray(raw) ? raw : [];
+  return source
+    .filter((call) => call && typeof call === "object")
+    .map((call) => {
+      const callerUserId = Number(call.caller_user_id || 0);
+      const targetId = Number(call.target_id || 0);
+      const calledAtMs = Math.max(0, Number(call.called_at_ms || 0));
+      const ff = call.ff_value == null ? null : Number(call.ff_value);
+      const est = call.est_value == null ? null : Number(call.est_value);
+
+      return {
+        caller_user_id: Number.isInteger(callerUserId) && callerUserId > 0 ? callerUserId : 0,
+        caller_user_name: String(call.caller_user_name || "").trim().slice(0, 64),
+        target_id: Number.isInteger(targetId) && targetId > 0 ? targetId : 0,
+        target_name: String(call.target_name || "").trim().slice(0, 64),
+        ff_value: Number.isFinite(ff) ? ff : null,
+        est_value: Number.isFinite(est) ? est : null,
+        called_at_ms: calledAtMs,
+      };
+    })
+    .filter((call) =>
+      call.caller_user_id &&
+      call.target_id &&
+      call.called_at_ms > 0 &&
+      now - call.called_at_ms <= TARGET_CALL_TTL_MS
+    );
+}
+
+function clearTargetCallForUser(room, userId) {
+  const before = Array.isArray(room.target_calls) ? room.target_calls.length : 0;
+  room.target_calls = normalizeTargetCalls(room.target_calls)
+    .filter((call) => Number(call.caller_user_id) !== Number(userId));
+  return room.target_calls.length !== before;
+}
+
 function defaultRoom() {
   return {
     session: null,
     queue: [],
     processed_attack_ids: [],
+    target_calls: [],
   };
 }
 
@@ -138,6 +176,7 @@ function sanitizeRoom(raw) {
     session: raw.session && typeof raw.session === "object" ? raw.session : null,
     queue: Array.isArray(raw.queue) ? raw.queue : [],
     processed_attack_ids: Array.isArray(raw.processed_attack_ids) ? raw.processed_attack_ids : [],
+    target_calls: normalizeTargetCalls(raw.target_calls),
   };
 }
 
@@ -234,6 +273,7 @@ function payloadFor(room, auth) {
       is_manager: Boolean(session && Number(session.manager_user_id) === Number(auth.user_id)),
       is_active: Boolean(session && Number(session.active_user_id) === Number(auth.user_id)),
     },
+    target_calls: normalizeTargetCalls(room.target_calls),
     server_time: Math.floor(Date.now() / 1000),
   };
 }
@@ -491,6 +531,7 @@ export class FactionRoom extends DurableObject {
     const userId = Number(auth.user_id);
     const now = Date.now();
     const nowSql = sqlUtc(now);
+    room.target_calls = normalizeTargetCalls(room.target_calls, now);
     const member = findMember(room, userId);
 
     const requireSession = () => {
@@ -569,8 +610,66 @@ export class FactionRoom extends DurableObject {
       return { room, mutated: true };
     }
 
+    if (action === "call_target") {
+      if (!room.session || !member) {
+        const err = new Error("Join the Chain Manager queue before calling a target");
+        err.status = 409;
+        throw err;
+      }
+
+      const targetId = Number(body.target_id || 0);
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        const err = new Error("Invalid target");
+        err.status = 400;
+        throw err;
+      }
+      if (targetId === userId) {
+        const err = new Error("You cannot call yourself");
+        err.status = 400;
+        throw err;
+      }
+
+      const taken = room.target_calls.find((call) =>
+        Number(call.target_id) === targetId &&
+        Number(call.caller_user_id) !== userId
+      );
+      if (taken) {
+        const err = new Error(
+          `Target already called by ${taken.caller_user_name || `#${taken.caller_user_id}`}`
+        );
+        err.status = 409;
+        throw err;
+      }
+
+      room.target_calls = room.target_calls.filter(
+        (call) => Number(call.caller_user_id) !== userId
+      );
+
+      const ff = body.ff_value == null ? null : Number(body.ff_value);
+      const est = body.est_value == null ? null : Number(body.est_value);
+
+      room.target_calls.push({
+        caller_user_id: userId,
+        caller_user_name: String(auth.user_name || member.user_name || `#${userId}`).trim().slice(0, 64),
+        target_id: targetId,
+        target_name: String(body.target_name || `#${targetId}`).trim().slice(0, 64),
+        ff_value: Number.isFinite(ff) ? ff : null,
+        est_value: Number.isFinite(est) ? est : null,
+        called_at_ms: now,
+      });
+
+      return { room, mutated: true, urgent: true };
+    }
+
+    if (action === "release_target") {
+      const changed = clearTargetCallForUser(room, userId);
+      return { room, mutated: changed, urgent: changed };
+    }
+
     if (action === "leave") {
       if (!room.session || !member) return { room, mutated: false };
+
+      clearTargetCallForUser(room, userId);
 
       const oldQueue = room.queue.slice();
       const oldIndex = oldQueue.findIndex((item) => Number(item.user_id) === userId);
@@ -652,8 +751,10 @@ export class FactionRoom extends DurableObject {
 
     if (action === "next") {
       const session = requireManager();
+      const oldActiveUserId = Number(session.active_user_id || 0);
+      if (oldActiveUserId) clearTargetCallForUser(room, oldActiveUserId);
       session.active_user_id = nextMemberId(room, session.active_user_id);
-      return { room, mutated: true };
+      return { room, mutated: true, urgent: true };
     }
 
     if (action === "transfer_manager") {
@@ -700,8 +801,19 @@ export class FactionRoom extends DurableObject {
       if (Number.isFinite(chainValue) && chainValue > Number(session.chain_current || 0)) {
         session.chain_current = Math.trunc(chainValue);
       }
+
+      const defenderId = Number(body.defender_id || 0);
+      if (defenderId > 0) {
+        const ownCall = room.target_calls.find(
+          (call) => Number(call.caller_user_id) === userId
+        );
+        if (ownCall && Number(ownCall.target_id) === defenderId) {
+          clearTargetCallForUser(room, userId);
+        }
+      }
+
       session.active_user_id = nextMemberId(room, userId);
-      return { room, mutated: true };
+      return { room, mutated: true, urgent: true };
     }
 
     const err = new Error("Unknown action");
@@ -724,7 +836,15 @@ async function routeRoomHttp(env, auth, path, request) {
   const headers = new Headers(request.headers);
   headers.set("X-Chain-Auth", encodeURIComponent(JSON.stringify(auth)));
 
-  return roomStub.fetch(`https://room${path}`, {
+  // Preserve the original query string when proxying into the Durable Object.
+  // The HTTP long-poll relies on ?since=<version>&wait=<ms>; dropping it turns
+  // the long-poll into an immediate response loop and massively increases the
+  // request rate.
+  const incomingUrl = new URL(request.url);
+  const roomUrl = new URL(`https://room${path}`);
+  roomUrl.search = incomingUrl.search;
+
+  return roomStub.fetch(roomUrl.toString(), {
     method: request.method,
     headers,
     body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,

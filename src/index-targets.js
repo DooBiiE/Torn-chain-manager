@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 
 export { AuthSession, FactionRoom };
 
-const TARGET_TRIAL_VERSION = "0.5.0";
+const TARGET_TRIAL_VERSION = "0.5.1";
 const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 const TARGET_STATE_KEY = "target_calls_v1";
 
@@ -226,32 +226,78 @@ export class TargetCalls extends DurableObject {
   }
 }
 
-async function authenticatedTargetRequest(request, env, pathname) {
-  const authHeader = String(request.headers.get("Authorization") || "");
-  const tokenMatch = authHeader.match(/^Bearer\s+([A-Fa-f0-9]{64})$/);
-  const token = tokenMatch ? tokenMatch[1] : "";
-  const auth = await resolveAuth(env, token);
+async function baseRequest(request, env, pathname, method, body = null) {
+  const url = new URL(request.url);
+  url.pathname = pathname;
+  url.search = "";
 
-  if (!auth) return json({ ok: false, error: "Session expired" }, 401);
-  if (!isFactionAllowed(env, auth.faction_id)) {
-    return json({ ok: false, error: "Your faction is not authorised to use this Chain Manager" }, 403);
+  const headers = new Headers(request.headers);
+  if (body != null) headers.set("Content-Type", "application/json");
+
+  return baseBackend.fetch(new Request(url.toString(), {
+    method,
+    headers,
+    body: body == null ? undefined : JSON.stringify(body),
+  }), env);
+}
+
+async function authenticatedTargetRequest(request, env, pathname) {
+  // Compatibility endpoints for older clients. New clients receive target_calls
+  // inside the normal queue state and use /api/v1/action for mutations.
+  if (request.method === "GET" && pathname === "/api/v1/targets") {
+    const response = await baseRequest(request, env, "/api/v1/state", "GET");
+    let data = {};
+    try { data = await response.json(); } catch {}
+    if (!response.ok) return json(data, response.status);
+
+    return json({
+      ok: true,
+      calls: Array.isArray(data.target_calls) ? data.target_calls : [],
+      server_time: data.server_time || Math.floor(Date.now() / 1000),
+    });
   }
 
   if (request.method === "POST" && pathname === "/api/v1/targets/call") {
-    const queueState = await getQueueState(env, auth);
-    if (!queueState?.viewer?.joined) {
-      return json({ ok: false, error: "Join the Chain Manager queue before calling a target" }, 409);
-    }
+    const body = await readJson(request);
+    const response = await baseRequest(request, env, "/api/v1/action", "POST", {
+      action: "call_target",
+      target_id: body.target_id,
+      target_name: body.target_name,
+      ff_value: body.ff_value,
+      est_value: body.est_value,
+    });
+
+    let data = {};
+    try { data = await response.json(); } catch {}
+    if (!response.ok) return json(data, response.status);
+
+    const viewerId = Number(data?.viewer?.user_id || 0);
+    const calls = Array.isArray(data.target_calls) ? data.target_calls : [];
+    return json({
+      ok: true,
+      calls,
+      call: calls.find((call) => Number(call.caller_user_id) === viewerId) || null,
+      server_time: data.server_time || Math.floor(Date.now() / 1000),
+    });
   }
 
-  const targetPath =
-    pathname === "/api/v1/targets" ? "/state" :
-    pathname === "/api/v1/targets/call" ? "/call" :
-    pathname === "/api/v1/targets/release" ? "/release" :
-    "";
+  if (request.method === "POST" && pathname === "/api/v1/targets/release") {
+    const response = await baseRequest(request, env, "/api/v1/action", "POST", {
+      action: "release_target",
+    });
 
-  if (!targetPath) return json({ ok: false, error: "Not found" }, 404);
-  return routeTargetRoom(env, auth, targetPath, request);
+    let data = {};
+    try { data = await response.json(); } catch {}
+    if (!response.ok) return json(data, response.status);
+
+    return json({
+      ok: true,
+      calls: Array.isArray(data.target_calls) ? data.target_calls : [],
+      server_time: data.server_time || Math.floor(Date.now() / 1000),
+    });
+  }
+
+  return json({ ok: false, error: "Not found" }, 404);
 }
 
 export default {
@@ -282,6 +328,7 @@ export default {
           version: TARGET_TRIAL_VERSION,
           queue_backend_version: data?.version || null,
           target_calls: true,
+          target_calls_shared_state: true,
           target_call_ttl_hours: TARGET_CALL_TTL_MS / 3600000,
         }, response.status);
       } catch {
