@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 
 export { AuthSession, FactionRoom };
 
-const TARGET_TRIAL_VERSION = "0.5.3";
+const TARGET_TRIAL_VERSION = "0.5.4";
 const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 const TARGET_STATE_KEY = "target_calls_v1";
 
