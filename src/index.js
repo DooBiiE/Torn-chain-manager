@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BACKEND_VERSION = "0.4.3";
+const BACKEND_VERSION = "0.4.4";
 const AUTH_TTL_SECONDS = 12 * 60 * 60;
 const ROOM_KEY = "room_state";
 const TARGET_CALL_TTL_MS = 4 * 60 * 60 * 1000;
@@ -833,21 +833,37 @@ export class FactionRoom extends DurableObject {
 async function routeRoomHttp(env, auth, path, request) {
   const roomId = env.FACTION_ROOMS.idFromName(String(auth.faction_id));
   const roomStub = env.FACTION_ROOMS.get(roomId);
-  const headers = new Headers(request.headers);
-  headers.set("X-Chain-Auth", encodeURIComponent(JSON.stringify(auth)));
 
-  // Preserve the original query string when proxying into the Durable Object.
-  // The HTTP long-poll relies on ?since=<version>&wait=<ms>; dropping it turns
-  // the long-poll into an immediate response loop and massively increases the
-  // request rate.
+  // Use a clean internal request rather than forwarding the browser's entire
+  // outer header set into the Durable Object. Only the room auth and JSON
+  // content metadata are needed internally.
+  const headers = new Headers({
+    "X-Chain-Auth": encodeURIComponent(JSON.stringify(auth)),
+    "Accept": "application/json",
+  });
+
+  const contentType = request.headers.get("Content-Type");
+  if (contentType) headers.set("Content-Type", contentType);
+
+  // Preserve the original query string. HTTP long-poll relies on
+  // ?since=<version>&wait=<ms>.
   const incomingUrl = new URL(request.url);
   const roomUrl = new URL(`https://room${path}`);
   roomUrl.search = incomingUrl.search;
 
+  // Buffer the small JSON action body before crossing the Worker -> Durable
+  // Object boundary. Reusing the original incoming ReadableStream here was the
+  // only transport difference between working Auth/State requests and the
+  // failing PC Join POST path.
+  let body;
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    body = await request.text();
+  }
+
   return roomStub.fetch(roomUrl.toString(), {
     method: request.method,
     headers,
-    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+    body: body === undefined ? undefined : body,
   });
 }
 
